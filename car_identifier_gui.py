@@ -59,6 +59,8 @@ class CarIdentifierGUI:
         self.processing = False
         self.batch_folder = None
         self.batch_processing = False
+        # Verification toggle
+        self.verify_second_pass = tk.BooleanVar(value=True)
         
         # Metadata handling preferences
         self.overwrite_existing = tk.StringVar(value="skip")  # "skip", "overwrite", "ask"
@@ -70,7 +72,7 @@ class CarIdentifierGUI:
         self.last_identified_thumbnail = None
         
         # Ollama client
-        self.ollama_client = ollama.Client(host='http://localhost:11434')
+        self.ollama_client = ollama.Client(host='http://localhost:11434', timeout=60)
         self.model_name = 'qwen2.5vl:32b-q4_K_M'  # Enhanced vision model for better logo/text recognition
         
         self.setup_ui()
@@ -211,24 +213,36 @@ class CarIdentifierGUI:
         """Run a tiny dummy vision call to warm the model/GPU in the background."""
         def _do_warm():
             try:
-                # 1x1 white JPEG as minimal payload
+                # Use a small but valid image (>= 28px on the short side) to avoid model panics
                 from PIL import Image
                 import io as _io
-                img = Image.new('RGB', (1, 1), color=(255, 255, 255))
+                img = Image.new('RGB', (64, 64), color=(255, 255, 255))
                 buf = _io.BytesIO()
-                img.save(buf, format='JPEG', quality=50)
+                img.save(buf, format='PNG')
                 img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
-                self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=[{
+                self._chat([
+                    {
                         'role': 'user',
                         'content': 'warmup',
                         'images': [img_b64]
-                    }]
-                )
+                    }
+                ])
             except Exception:
                 pass
+    def _chat(self, messages):
+        """Centralized chat call with keep-alive and conservative generation options."""
+        return self.ollama_client.chat(
+            model=self.model_name,
+            messages=messages,
+            keep_alive="10m",
+            options={
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "num_predict": 160,
+            },
+        )
+
 
         t = threading.Thread(target=_do_warm, daemon=True)
         t.start()
@@ -399,6 +413,11 @@ class CarIdentifierGUI:
         enh_cb = ttk.Checkbutton(options_frame, text="🤖 Enhanced Reasoning", 
                                   variable=self.enhanced_inference, style='Dark.TCheckbutton')
         enh_cb.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Second-pass verification toggle
+        verify_cb = ttk.Checkbutton(options_frame, text="🔎 Verify (2nd Pass)", 
+                                     variable=self.verify_second_pass, style='Dark.TCheckbutton')
+        verify_cb.pack(side=tk.LEFT, padx=(0, 20))
         
         # Metadata handling dropdown
         metadata_label = ttk.Label(options_frame, text="Existing Metadata:", style='Dark.TLabel')
@@ -1232,7 +1251,7 @@ class CarIdentifierGUI:
         
         self.processing = True
         self.process_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="🔄 Processing image (optimized 1280px, PNG)...", foreground=self.colors['accent'])
+        self.status_label.config(text="🔄 Processing image (optimized 1024px, PNG)...", foreground=self.colors['accent'])
         
         # Start processing in a separate thread
         thread = threading.Thread(target=self._process_image_thread)
@@ -1255,39 +1274,60 @@ class CarIdentifierGUI:
             # Get original dimensions
             original_width, original_height = img.size
             print(f"📏 Original image: {original_width}x{original_height}")
-            
-            # Resize if image is too large (reduces processing time significantly)
-            max_size = 1280
-            if original_width > max_size or original_height > max_size:
-                # Calculate new size maintaining aspect ratio
+
+            # Decide whether resize is required (either to meet min side or cap max side)
+            min_required = 28
+            max_size = 1024
+            need_upscale = (
+                original_width > 0 and original_height > 0 and min(original_width, original_height) < min_required
+            )
+            need_downscale = original_width > max_size or original_height > max_size
+
+            # If no resize is required, return the original bytes to avoid size bloat
+            if not need_upscale and not need_downscale:
+                print("📈 Skipped optimization: image within bounds; sending original bytes")
+                with open(image_path, 'rb') as f:
+                    return base64.b64encode(f.read()).decode('utf-8')
+
+            # Perform required resize
+            if need_upscale:
+                if original_width < original_height:
+                    new_width = min_required
+                    new_height = int(round(original_height * (min_required / original_width)))
+                else:
+                    new_height = min_required
+                    new_width = int(round(original_width * (min_required / original_height)))
+                img = img.resize((max(1, new_width), max(1, new_height)), Image.Resampling.LANCZOS)
+                print(f"📏 Upscaled to meet min side {min_required}px: {img.size[0]}x{img.size[1]}")
+            elif need_downscale:
                 if original_width > original_height:
                     new_width = max_size
                     new_height = int(original_height * max_size / original_width)
                 else:
                     new_height = max_size
                     new_width = int(original_width * max_size / original_height)
-                
-                # Use high-quality resampling for better accuracy
                 img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 print(f"📏 Resized to: {new_width}x{new_height} (optimized for processing)")
-            
+
             # Convert to RGB if needed (some models require RGB)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            
-            # Encode PNG for better OCR fidelity
+
+            # Encode as JPEG to keep bytes compact when we had to resize
             buffer = io.BytesIO()
-            img.save(buffer, format='PNG', optimize=True)
+            img.save(buffer, format='JPEG', quality=90, optimize=True)
             img_data = buffer.getvalue()
             
             # Encode to base64
             img_base64 = base64.b64encode(img_data).decode('utf-8')
             
-            # Calculate size reduction
+            # Calculate size reduction (informational only)
             original_size = os.path.getsize(image_path)
             optimized_size = len(img_data)
-            reduction = ((original_size - optimized_size) / original_size) * 100
-            
+            try:
+                reduction = ((original_size - optimized_size) / max(1, original_size)) * 100
+            except Exception:
+                reduction = 0.0
             print(f"📈 Size optimization: {original_size/1024:.1f}KB → {optimized_size/1024:.1f}KB ({reduction:.1f}% reduction)")
             
             return img_base64
@@ -1297,7 +1337,19 @@ class CarIdentifierGUI:
             # Safe fallback: stream read and cap size
             try:
                 with Image.open(image_path) as img:
-                    img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+                    # Ensure minimum short side first
+                    w, h = img.size
+                    min_required = 28
+                    if w > 0 and h > 0 and min(w, h) < min_required:
+                        if w < h:
+                            new_w = min_required
+                            new_h = int(round(h * (min_required / w)))
+                        else:
+                            new_h = min_required
+                            new_w = int(round(w * (min_required / h)))
+                        img = img.resize((max(1, new_w), max(1, new_h)), Image.Resampling.LANCZOS)
+                    # Then cap the max size
+                    img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
                     buf = io.BytesIO()
                     img.save(buf, format='PNG', optimize=True)
                     return base64.b64encode(buf.getvalue()).decode('utf-8')
@@ -1311,8 +1363,18 @@ class CarIdentifierGUI:
         Legacy-simple, robust path: single image only, classic prompt, line-parse first; JSON only as fallback."""
         # Input strategy
         if self.high_fidelity_input.get():
-            with open(str(image_path), 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
+            # Even in high-fidelity mode, ensure minimum dimensions to avoid model panics
+            try:
+                with Image.open(str(image_path)) as _chk:
+                    w_chk, h_chk = _chk.size
+                if w_chk > 0 and h_chk > 0 and min(w_chk, h_chk) < 28:
+                    img_base64 = self.optimize_image_for_ollama(str(image_path))
+                else:
+                    with open(str(image_path), 'rb') as f:
+                        img_base64 = base64.b64encode(f.read()).decode('utf-8')
+            except Exception:
+                with open(str(image_path), 'rb') as f:
+                    img_base64 = base64.b64encode(f.read()).decode('utf-8')
         else:
             img_base64 = self.optimize_image_for_ollama(str(image_path))
 
@@ -1330,10 +1392,9 @@ class CarIdentifierGUI:
         )
 
         # Single-image call (no crops)
-        response = self.ollama_client.chat(
-            model=self.model_name,
-            messages=[{'role': 'user', 'content': prompt, 'images': [img_base64]}]
-        )
+        response = self._chat([
+            {'role': 'user', 'content': prompt, 'images': [img_base64]}
+        ])
 
         # Prefer direct field first (old behavior), then fall back to robust extractor
         try:
@@ -1344,14 +1405,39 @@ class CarIdentifierGUI:
         if not parsed or self._is_mostly_unknown(parsed):
             # Try JSON fallback
             parsed = self._parse_or_fallback_json(text)
+
+        # Second-pass verification to correct sloppy identifications (toggle)
+        if self.verify_second_pass.get():
+            # Show verifying status in UI
+            try:
+                self.root.after(0, lambda: self.status_label.config(
+                    text="🔎 Verifying (2nd pass)…", foreground=self.colors['accent']))
+            except Exception:
+                pass
+            try:
+                verified = self._verify_with_second_pass(image_path, parsed, img_base64)
+                if verified and isinstance(verified, tuple) and verified[1]:
+                    text, parsed = verified
+            except Exception:
+                pass
         return (text or ''), parsed
 
     def _infer_image_enhanced(self, image_path: str):
         """Enhanced inference with persona guidance and focused crops. Returns (raw_text, parsed_dict)."""
         # Input strategy
         if self.high_fidelity_input.get():
-            with open(str(image_path), 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
+            # Even in high-fidelity mode, ensure minimum dimensions to avoid model panics
+            try:
+                with Image.open(str(image_path)) as _chk:
+                    w_chk, h_chk = _chk.size
+                if w_chk > 0 and h_chk > 0 and min(w_chk, h_chk) < 28:
+                    img_base64 = self.optimize_image_for_ollama(str(image_path))
+                else:
+                    with open(str(image_path), 'rb') as f:
+                        img_base64 = base64.b64encode(f.read()).decode('utf-8')
+            except Exception:
+                with open(str(image_path), 'rb') as f:
+                    img_base64 = base64.b64encode(f.read()).decode('utf-8')
         else:
             img_base64 = self.optimize_image_for_ollama(str(image_path))
 
@@ -1371,15 +1457,13 @@ class CarIdentifierGUI:
 
         # Call Ollama with multi-image payload; fallback to single image
         try:
-            response = self.ollama_client.chat(
-                model=self.model_name,
-                messages=[{'role': 'user', 'content': prompt, 'images': images_payload}]
-            )
+            response = self._chat([
+                {'role': 'user', 'content': prompt, 'images': images_payload}
+            ])
         except Exception:
-            response = self.ollama_client.chat(
-                model=self.model_name,
-                messages=[{'role': 'user', 'content': prompt, 'images': [img_base64]}]
-            )
+            response = self._chat([
+                {'role': 'user', 'content': prompt, 'images': [img_base64]}
+            ])
 
         # Prefer direct content first (matches old reliable path), then extractor
         try:
@@ -1396,10 +1480,9 @@ class CarIdentifierGUI:
                 "License Plate: <plate or Unknown>\nAI-Interpretation Summary: <<=200 chars>"
             )
             try:
-                response_fix = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=[{'role': 'user', 'content': repair_prompt, 'images': [img_base64]}]
-                )
+                response_fix = self._chat([
+                    {'role': 'user', 'content': repair_prompt, 'images': [img_base64]}
+                ])
                 text_fix = self._extract_message_text(response_fix)
                 parsed_fix = self._parse_or_fallback_json(text_fix)
                 for k, v in parsed_fix.items():
@@ -1415,10 +1498,9 @@ class CarIdentifierGUI:
                 "No prose. Fill with 'Unknown' if not visible."
             )
             try:
-                resp2 = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=[{'role': 'user', 'content': strict, 'images': [img_base64]}]
-                )
+                resp2 = self._chat([
+                    {'role': 'user', 'content': strict, 'images': [img_base64]}
+                ])
                 txt2 = self._extract_message_text(resp2)
                 parsed2 = self._parse_or_fallback_json(txt2)
                 if parsed2:
@@ -1435,7 +1517,78 @@ class CarIdentifierGUI:
             except Exception:
                 pass
 
+        # Second-pass verification to correct sloppy identifications (toggle)
+        if self.verify_second_pass.get():
+            # Show verifying status in UI
+            try:
+                self.root.after(0, lambda: self.status_label.config(
+                    text="🔎 Verifying (2nd pass)…", foreground=self.colors['accent']))
+            except Exception:
+                pass
+            try:
+                verified = self._verify_with_second_pass(image_path, parsed, img_base64)
+                if verified and isinstance(verified, tuple) and verified[1]:
+                    v_text, v_parsed = verified
+                    # Restore complete status and return verified
+                    try:
+                        self.root.after(0, lambda: self.status_label.config(
+                            text="✅ Processing complete", foreground=self.colors['success']))
+                    except Exception:
+                        pass
+                    return (v_text or primary_text or ''), v_parsed
+            except Exception:
+                pass
+
         return (primary_text or ''), parsed
+
+    def _verify_with_second_pass(self, image_path, initial_parsed, img_base64=None):
+        """Ask the model to re-check and correct the 6 fields strictly from the image.
+        Returns (verified_text, verified_parsed) or None if verification fails."""
+        try:
+            # Prepare image
+            if not img_base64:
+                if self.high_fidelity_input.get():
+                    try:
+                        with Image.open(str(image_path)) as _chk:
+                            w_chk, h_chk = _chk.size
+                        if w_chk > 0 and h_chk > 0 and min(w_chk, h_chk) < 28:
+                            img_base64 = self.optimize_image_for_ollama(str(image_path))
+                        else:
+                            with open(str(image_path), 'rb') as f:
+                                img_base64 = base64.b64encode(f.read()).decode('utf-8')
+                    except Exception:
+                        with open(str(image_path), 'rb') as f:
+                            img_base64 = base64.b64encode(f.read()).decode('utf-8')
+                else:
+                    img_base64 = self.optimize_image_for_ollama(str(image_path))
+
+            # Compose strict verification prompt
+            ip = initial_parsed or {}
+            guess = (
+                f"Make: {ip.get('Make','')}\n"
+                f"Model: {ip.get('Model','')}\n"
+                f"Color: {ip.get('Color','')}\n"
+                f"Logos: {ip.get('Logos','')}\n"
+                f"License Plate: {ip.get('License Plate','')}\n"
+                f"AI-Interpretation Summary: {ip.get('AI-Interpretation Summary','')}\n"
+            )
+            verify_prompt = (
+                "Re-check the identification STRICTLY from the image. If uncertain for any field, write 'Unknown'.\n"
+                "Do not guess. Prefer exact text from badges/plates. Return ONLY these 6 lines, nothing else:\n"
+                "Make: <brand>\nModel: <model>\nColor: <color>\nLogos: <logos/emblems/text>\n"
+                "License Plate: <plate or Unknown>\nAI-Interpretation Summary: <<=200 chars>\n\n"
+                "Here is the initial guess (correct it if wrong):\n" + guess
+            )
+            resp = self._chat([
+                {'role': 'user', 'content': verify_prompt, 'images': [img_base64]}
+            ])
+            v_text = self._extract_message_text(resp)
+            v_parsed = self._parse_or_fallback_json(v_text)
+            if v_parsed:
+                return v_text, v_parsed
+        except Exception:
+            return None
+        return None
 
     def _generate_detail_crops(self, image_path):
         """Return a list of base64 PNG crops focusing on areas helpful for car model disambiguation
@@ -1448,7 +1601,8 @@ class CarIdentifierGUI:
             def enc_crop(left, top, right, bottom):
                 try:
                     box = (max(0, int(left)), max(0, int(top)), min(w, int(right)), min(h, int(bottom)))
-                    if box[2] - box[0] <= 10 or box[3] - box[1] <= 10:
+                    # Require minimum 28px per side to satisfy model preprocessor
+                    if (box[2] - box[0]) < 28 or (box[3] - box[1]) < 28:
                         return None
                     crop = img.crop(box)
                     # Normalize crop size for vision models
@@ -1483,8 +1637,19 @@ class CarIdentifierGUI:
                     raw_text, parsed = self._infer_image_simple(self.current_image_path)
             else:
                 raw_text, parsed = self._infer_image_simple(self.current_image_path)
-            # Always show the model's raw text for single-image to match prior good behavior
-            self.root.after(0, lambda t=raw_text: self._update_results(t))
+                # If simple path produced no visible text, fallback to JSON or enhanced
+                if not raw_text:
+                    try:
+                        raw_text = json.dumps(parsed or {}, indent=2)
+                    except Exception:
+                        raw_text = ''
+                if not raw_text:
+                    try:
+                        raw_text, parsed = self._infer_image_enhanced(self.current_image_path)
+                    except Exception:
+                        pass
+            # Always show some text in the panel
+            self.root.after(0, lambda t=raw_text or json.dumps(parsed or {}, indent=2): self._update_results(t))
             
         except Exception as e:
             error_msg = f"Error processing image: {str(e)}"
@@ -1873,10 +2038,9 @@ class CarIdentifierGUI:
             try:
                 img_b64 = self.optimize_image_for_ollama(self.current_image_path)
                 p = prompt_a.get('1.0', tk.END).strip() if which == 'A' else prompt_b.get('1.0', tk.END).strip()
-                resp = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=[{'role': 'user', 'content': p, 'images': [img_b64]}]
-                )
+                resp = self._chat([
+                    {'role': 'user', 'content': p, 'images': [img_b64]}
+                ])
                 txt = self._extract_message_text(resp)
                 parsed = self._parse_results(txt)
                 pretty = json.dumps(parsed, indent=2)
@@ -2047,10 +2211,19 @@ class CarIdentifierGUI:
                         self.root.after(0, lambda img=image_path, data=result['data'], raw=result['raw_response']:
                                         self.update_last_identified_panel(img, data, raw))
                     
-                    # Save metadata for batch results (sidecars always; embed if enabled)
+                    # Save metadata for batch results (embed if enabled)
                     if result['success']:
-                        # Embed into JPG only; no sidecars
-                        md_clean, title, description, keywords = self._compute_semantic_fields(result['data'])
+                        # Prefer parsed data; if weak/unknown, re-parse from displayed text
+                        data_for_write = result.get('data') or {}
+                        try:
+                            if (not data_for_write) or self._is_mostly_unknown(data_for_write):
+                                reparsed = self._parse_or_fallback_json(result.get('raw_response') or '')
+                                if reparsed:
+                                    data_for_write = reparsed
+                        except Exception:
+                            pass
+                        # Compute fields and write
+                        md_clean, title, description, keywords = self._compute_semantic_fields(data_for_write)
                         if str(image_path).lower().endswith(('.jpg', '.jpeg')):
                             self.write_metadata_to_image(str(image_path), md_clean)
                 else:
@@ -2195,27 +2368,21 @@ IMPORTANT: Look carefully for any text, badges, or logos on the car and include 
 
             # Call Ollama
             try:
-                response = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=[
-                        {
-                            'role': 'user',
-                            'content': prompt,
-                            'images': images_payload
-                        }
-                    ]
-                )
+                response = self._chat([
+                    {
+                        'role': 'user',
+                        'content': prompt,
+                        'images': images_payload
+                    }
+                ])
             except Exception:
-                response = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=[
-                        {
-                            'role': 'user',
-                            'content': prompt,
-                            'images': [img_base64]
-                        }
-                    ]
-                )
+                response = self._chat([
+                    {
+                        'role': 'user',
+                        'content': prompt,
+                        'images': [img_base64]
+                    }
+                ])
 
             # Parse response; keep raw text as primary display for parity with single-image
             result_text = self._extract_message_text(response)
@@ -2235,10 +2402,9 @@ IMPORTANT: Look carefully for any text, badges, or logos on the car and include 
                     "AI-Interpretation Summary: <<=200 chars>"
                 )
                 try:
-                    response_fix = self.ollama_client.chat(
-                        model=self.model_name,
-                        messages=[{ 'role': 'user', 'content': repair_prompt, 'images': [img_base64] }]
-                    )
+                    response_fix = self._chat([
+                        { 'role': 'user', 'content': repair_prompt, 'images': [img_base64] }
+                    ])
                     rt_fix = self._extract_message_text(response_fix)
                     parsed_fix = self._parse_results(rt_fix)
                     for k, v in parsed_fix.items():
@@ -2251,10 +2417,9 @@ IMPORTANT: Look carefully for any text, badges, or logos on the car and include 
                             "No prose. Fill with 'Unknown' if not visible."
                         )
                         try:
-                            resp2 = self.ollama_client.chat(
-                                model=self.model_name,
-                                messages=[{ 'role': 'user', 'content': strict, 'images': [img_base64] }]
-                            )
+                            resp2 = self._chat([
+                                { 'role': 'user', 'content': strict, 'images': [img_base64] }
+                            ])
                             result_text = self._extract_message_text(resp2)
                             parsed_data = self._parse_or_fallback_json(result_text)
                         except Exception:
@@ -2310,29 +2475,49 @@ IMPORTANT: Look carefully for any text, badges, or logos on the car and include 
 
             metadata_str = json.dumps(metadata, indent=2)
 
+            # Normalize and sanitize metadata values to avoid empty tags
+            def _clean_text(value):
+                text = (value or "").strip()
+                if not text:
+                    return ""
+                if text.lower() in {"unknown", "n/a", "na", "none", "not visible", "unclear"}:
+                    return ""
+                return text
+
+            md_lower = {str(k).lower(): v for k, v in (metadata or {}).items()}
+            make_val = _clean_text(metadata.get('Make') or md_lower.get('make') or md_lower.get('car make'))
+            model_val = _clean_text(metadata.get('Model') or md_lower.get('model') or md_lower.get('car model'))
+            color_val = _clean_text(metadata.get('Color') or md_lower.get('color') or md_lower.get('car color'))
+            license_val = _clean_text(metadata.get('License Plate') or md_lower.get('license plate') or md_lower.get('license') or md_lower.get('plate'))
+
             # Build keywords (unique, short tokens only)
             keywords = []
-            if 'Make' in metadata:
-                keywords.extend([f"Car Make: {metadata['Make']}", metadata['Make']])
-            if 'Model' in metadata:
-                keywords.append(f"Car Model: {metadata['Model']}")
-                for part in metadata['Model'].split():
+            if make_val:
+                keywords.extend([f"Car Make: {make_val}", make_val])
+            if model_val:
+                keywords.append(f"Car Model: {model_val}")
+                for part in model_val.split():
                     if 1 < len(part) <= 32:
                         keywords.append(part)
-            if 'Color' in metadata:
-                keywords.extend([f"Car Color: {metadata['Color']}", metadata['Color']])
-            if 'License Plate' in metadata:
-                keywords.append(f"License: {metadata['License Plate']}")
+            if color_val:
+                keywords.extend([f"Car Color: {color_val}", color_val])
+            if license_val:
+                keywords.append(f"License: {license_val}")
             keywords += ["Car Photo", "Vehicle", "Automotive"]
             unique_keywords = []
             for kw in keywords:
-                if kw not in unique_keywords:
-                    unique_keywords.append(kw)
+                kwc = (kw or "").strip()
+                if kwc and kwc not in unique_keywords:
+                    unique_keywords.append(kwc)
 
-            description = f"Car: {metadata.get('Make', 'Unknown')} {metadata.get('Model', 'Unknown')} - {metadata.get('Color', 'Unknown color')}"
-            if 'License Plate' in metadata:
-                description += f" - License: {metadata['License Plate']}"
-            title = f"{metadata.get('Make', 'Car')} {metadata.get('Model', '')}".strip()
+            # Description and title only include available parts
+            name_part = " ".join([p for p in [make_val, model_val] if p]).strip()
+            description = f"Car: {name_part or 'Unknown'}"
+            if color_val:
+                description += f" - {color_val}"
+            if license_val:
+                description += f" - License: {license_val}"
+            title = " ".join([p for p in [make_val or 'Car', model_val] if p]).strip()
 
             # Compose XMP (kept for compatibility if needed in future)
             xmp_data = self._create_xmp_metadata(metadata, unique_keywords, description)
@@ -2360,9 +2545,16 @@ IMPORTANT: Look carefully for any text, badges, or logos on the car and include 
             if exiftool_available:
                 try:
                     import subprocess
+                    # Pass keywords individually so they become separate tags
+                    iptc_args = []
+                    for i, kw in enumerate(unique_keywords):
+                        if i == 0:
+                            iptc_args.append(f"-IPTC:Keywords={kw}")
+                        else:
+                            iptc_args.append(f"-IPTC:Keywords+={kw}")
                     result = subprocess.run([
                         './exiftool.exe', '-overwrite_original',
-                        f'-IPTC:Keywords={", ".join(unique_keywords)}',
+                        *iptc_args,
                         f'-IPTC:Caption-Abstract={description}',
                         f'-IPTC:ObjectName={title}',
                         image_path_str
