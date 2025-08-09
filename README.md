@@ -1,0 +1,1 @@
+# Car Identifier GUI\r\n\r\nSimple Tkinter GUI for car identification using Ollama vision models.\r\n\r\n## Run\r\n`ash\r\npython car_identifier_gui.py\r\n`\r\n\r\nRequires Ollama running on localhost:11434 and a vision-capable model (e.g., qwen2.5vl).\r\n
